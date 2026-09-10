@@ -1,0 +1,150 @@
+# ============================================================================
+# SGG — docker-compose.yaml (PRODUCCIÓN, residencias)
+#
+# Imágenes pinneadas por SGG_VERSION desde GHCR privado (NANDI-Services).
+# Requiere `docker login ghcr.io` previo con PAT classic scope read:packages
+# (install.sh lo hace por vos). Bootstrap: `bash install.sh`.
+#
+# Servicios:
+#   db          — postgres:16-alpine + pgBackRest + dcron (imagen custom).
+#   migrations  — job one-shot: prisma migrate deploy. Corre y sale.
+#   api         — Fastify. Puerto 3001.
+#   web         — Next.js standalone. Puerto 3000.
+#
+# Uso diario:
+#   sgg update        — pull nuevas imágenes + reinicio con downtime ~15s
+#   sgg logs [svc]    — tail
+#   sgg doctor        — health + disco + pgbackrest info
+#   sgg backup-now    — full backup manual
+# ============================================================================
+
+services:
+  db:
+    image: ghcr.io/nandi-services/sgg-db:v${SGG_VERSION:?SGG_VERSION obligatorio}
+    container_name: sgg-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sgg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD obligatorio}
+      POSTGRES_DB: ${POSTGRES_DB:-sgg}
+      PGBACKREST_REPO_CIPHER_PASS: ${PGBACKREST_REPO_CIPHER_PASS:?PGBACKREST_REPO_CIPHER_PASS obligatorio (perderla = perder backups)}
+    # Puerto NO expuesto al host en producción. Acceso via `docker compose exec`.
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    volumes:
+      - sgg_pgdata:/var/lib/postgresql/data
+      - sgg_pgbackrest:/var/lib/pgbackrest
+    healthcheck:
+      # pg_isready da false-positive durante initdb en postgres:16-alpine (postgres
+      # temporal en socket local responde ready antes de crear el user/db reales).
+      # psql SELECT 1 sólo pasa cuando la DB real existe → guard fiable para
+      # migrations service_healthy. Ver CLAUDE.md §Lessons Learned.
+      test:
+        [
+          "CMD-SHELL",
+          'su -s /bin/sh postgres -c "psql -h /var/run/postgresql -U ''${POSTGRES_USER:-sgg}'' -d ''${POSTGRES_DB:-sgg}'' -tAc ''SELECT 1''" >/dev/null 2>&1',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  migrations:
+    image: ghcr.io/nandi-services/sgg-api:v${SGG_VERSION:?SGG_VERSION obligatorio}
+    container_name: sgg-migrations
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sgg}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sgg}?schema=public
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@sgg.local}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:?SEED_ADMIN_PASSWORD obligatorio en producción}
+      SEED_ADMIN_NAME: ${SEED_ADMIN_NAME:-Administrador SGG}
+    working_dir: /repo/apps/api
+    # Migrate + seed en el mismo job. Sin seed no hay user admin → login 500
+    # en instalaciones fresh. Seed corre directo con `node --import tsx/esm`
+    # porque `prisma db seed` invoca `tsx prisma/seed.ts` (hook de
+    # package.json#prisma.seed) y `tsx` no está en el PATH del container
+    # (Dockerfile no lo instala como binario global). Idempotente: seed.ts
+    # hace upsert por email del admin.
+    command:
+      [
+        "sh",
+        "-c",
+        "node --import tsx/esm node_modules/prisma/build/index.js migrate deploy && node --import tsx/esm prisma/seed.ts",
+      ]
+    restart: "no"
+
+  api:
+    image: ghcr.io/nandi-services/sgg-api:v${SGG_VERSION:?SGG_VERSION obligatorio}
+    container_name: sgg-api
+    depends_on:
+      db:
+        condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sgg}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-sgg}?schema=public
+      API_HOST: 0.0.0.0
+      API_PORT: 3001
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET obligatorio}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-30m}
+      REFRESH_TOKEN_SECRET: ${REFRESH_TOKEN_SECRET:?REFRESH_TOKEN_SECRET obligatorio}
+      REFRESH_TOKEN_EXPIRES_IN_DAYS: ${REFRESH_TOKEN_EXPIRES_IN_DAYS:-1}
+      SGG_ALLOW_LONG_SESSIONS: ${SGG_ALLOW_LONG_SESSIONS:-false}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@sgg.local}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:?SEED_ADMIN_PASSWORD obligatorio en producción}
+      SEED_ADMIN_NAME: ${SEED_ADMIN_NAME:-Administrador SGG}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      # Auto-update (docs/plans/autoupdate-plan.md §14). Todas con default y
+      # ninguna obligatoria: una instalación sin migrar a auto-update levanta
+      # igual. SGG_AGENT_TOKEN vacío = endpoints internos del agente inertes.
+      SGG_UPDATE_CHANNEL: ${SGG_UPDATE_CHANNEL:-patch}
+      SGG_UPDATE_WINDOW: ${SGG_UPDATE_WINDOW:-03:00-05:00}
+      SGG_UPDATE_DEADLINE_HOURS: ${SGG_UPDATE_DEADLINE_HOURS:-72}
+      SGG_AGENT_TOKEN: ${SGG_AGENT_TOKEN:-}
+      SGG_INSTANCE_NAME: ${SGG_INSTANCE_NAME:-}
+      # Repo de GitHub que el discovery consulta. Knob de ENSAYO (E2E de la
+      # Fase 6, docs/specs/e2e-autoupdate.md): en campo no se toca nunca.
+      SGG_UPDATE_RELEASES_REPO: ${SGG_UPDATE_RELEASES_REPO:-NANDI-Services/SGG-releases}
+      # Cookies con flag Secure. Default false para pilot en LAN sin HTTPS.
+      # Setear true cuando haya reverse-proxy TLS (Caddy, nginx, Cloudflare).
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  web:
+    image: ghcr.io/nandi-services/sgg-web:v${SGG_VERSION:?SGG_VERSION obligatorio}
+    container_name: sgg-web
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      # Rewrite target del proxy `/api/*` (ver next.config.ts). Runtime env:
+      # el bundle es cliente-agnóstico, sirve cualquier IP/dominio sin rebuild.
+      INTERNAL_API_URL: http://api:3001
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  sgg_pgdata:
+  sgg_pgbackrest:
